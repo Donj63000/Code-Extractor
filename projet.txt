@@ -1,0 +1,301 @@
+### File: main.py | Position: 1/1
+----------------------------------
+#!/usr/bin/env python3
+# =============================================================================
+#  concat_project_sources.py  –  v2 (sélection de fichiers)
+#  ---------------------------------------------------------------------------
+#  Concatène une sélection (ou l’ensemble) des fichiers .py / .java d’un
+#  répertoire projet dans un unique .txt.  Interface Tkinter “Windows‑like”.
+#
+#  MIT License © 2025 Valentin GIDON – libre de modifier / distribuer / vendre.
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+from pathlib import Path
+from queue import Queue, Empty
+from typing import Iterable, Sequence
+
+import tkinter as tk
+from tkinter import ttk, StringVar, filedialog, messagebox, Toplevel
+
+# --------------------------------------------------------------------------- #
+#  CONFIGURATION                                                              #
+# --------------------------------------------------------------------------- #
+ALLOWED_EXT = {".py", ".java"}
+IGNORED_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "build", "dist"}
+DEFAULT_OUT_NAME = "projet.txt"
+READ_CHUNK_SIZE = 1024 * 1024           # 1 MiB
+
+# --------------------------------------------------------------------------- #
+#  UTILITAIRES                                                                #
+# --------------------------------------------------------------------------- #
+def discover_sources(root: Path) -> list[Path]:
+    """Retourne tous les fichiers autorisés, triés, hors IGNORED_DIRS."""
+    def is_ignored(p: Path) -> bool:
+        return any(part in IGNORED_DIRS for part in p.parts)
+
+    return sorted(
+        (
+            p
+            for p in root.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in ALLOWED_EXT
+            and not is_ignored(p.relative_to(root))
+        ),
+        key=lambda p: p.relative_to(root).as_posix().lower(),
+    )
+
+
+def read_file_stream(path: Path) -> Iterable[str]:
+    """Lit un fichier par blocs en gérant l’encodage (UTF‑8 → Latin‑1)."""
+    try:
+        with path.open("r", encoding="utf‑8") as f:
+            while chunk := f.read(READ_CHUNK_SIZE):
+                yield chunk
+    except UnicodeDecodeError:
+        with path.open("r", encoding="latin‑1", errors="replace") as f:
+            while chunk := f.read(READ_CHUNK_SIZE):
+                yield chunk
+
+
+def export_worker(root: Path, files: Sequence[Path], out_path: Path, q: Queue) -> None:
+    """Thread : écrit les fichiers sélectionnés, envoie la progression via Queue."""
+    try:
+        total = len(files)
+        if total == 0:
+            q.put(("error", "Vous n’avez sélectionné aucun fichier."))
+            return
+
+        with out_path.open("w", encoding="utf‑8") as out:
+            for idx, file_path in enumerate(files, start=1):
+                rel = file_path.relative_to(root)
+                header = f"### File: {rel} | Position: {idx}/{total}\n"
+                out.write(header)
+                out.write("-" * len(header) + "\n")
+
+                for chunk in read_file_stream(file_path):
+                    out.write(chunk)
+                out.write("\n\n")
+
+                q.put(("progress", idx, total))
+
+        q.put(("done", total, out_path))
+
+    except Exception as exc:           # noqa: BLE001
+        q.put(("error", str(exc)))
+
+
+# --------------------------------------------------------------------------- #
+#  FENÊTRE DE SÉLECTION DE FICHIERS                                           #
+# --------------------------------------------------------------------------- #
+class SelectionDialog(Toplevel):
+    """Fenêtre modale listant les fichiers avec multi‑sélection."""
+
+    def __init__(self, master: tk.Misc, files: Sequence[Path]) -> None:
+        super().__init__(master)
+        self.title("Sélection des fichiers à exporter")
+        self.grab_set()                       # modal
+        self.resizable(False, False)
+
+        self.files = files                    # liste complète triée
+        self.validated: list[Path] | None = None
+
+        # --- Listbox + scrollbar
+        frame = ttk.Frame(self)
+        frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.listbox = tk.Listbox(frame, selectmode="extended", width=80, height=25)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.listbox.configure(yscrollcommand=sb.set)
+
+        # Remplir et présélectionner
+        for p in files:
+            self.listbox.insert(tk.END, p.as_posix())
+        self.listbox.select_set(0, tk.END)
+
+        # --- Boutons
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=1, column=0, pady=(0, 10))
+        ttk.Button(btn_frame, text="Tout sélectionner", command=self.select_all).grid(row=0, column=0, padx=5)
+        ttk.Button(btn_frame, text="Tout désélectionner", command=self.deselect_all).grid(row=0, column=1, padx=5)
+        ttk.Button(btn_frame, text="Valider", command=self.validate).grid(row=0, column=2, padx=15)
+        ttk.Button(btn_frame, text="Annuler", command=self.cancel).grid(row=0, column=3, padx=5)
+
+        self.bind("<Escape>", lambda _e: self.cancel())
+
+    # ---------- actions
+    def select_all(self) -> None:
+        self.listbox.select_set(0, tk.END)
+
+    def deselect_all(self) -> None:
+        self.listbox.select_clear(0, tk.END)
+
+    def validate(self) -> None:
+        sel = self.listbox.curselection()
+        self.validated = [self.files[i] for i in sel]
+        self.destroy()
+
+    def cancel(self) -> None:
+        self.validated = None
+        self.destroy()
+
+
+# --------------------------------------------------------------------------- #
+#  CLASSE PRINCIPALE                                                          #
+# --------------------------------------------------------------------------- #
+class ConcatApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Concaténation de sources • Rochias")
+        self.minsize(680, 280)
+        self.resizable(False, False)
+
+        self.project_dir: Path | None = None
+        self.files_full: list[Path] = []
+        self.queue: Queue = Queue()
+
+        # ---------------- Widgets principaux --------------------------------
+        self.project_var = StringVar(value="Aucun dossier sélectionné")
+        self.status_var = StringVar(value="Prêt")
+
+        ttk.Label(self, text="Dossier du projet :").grid(row=0, column=0, padx=12, pady=12, sticky="w")
+        ttk.Entry(self, textvariable=self.project_var, width=65, state="readonly").grid(
+            row=0, column=1, padx=12, pady=12, sticky="ew"
+        )
+        ttk.Button(self, text="Parcourir…", command=self.choose_project).grid(row=0, column=2, padx=12, pady=12)
+
+        self.btn_export = ttk.Button(self, text="Exporter →", command=self.open_selector, state="disabled")
+        self.btn_export.grid(row=1, column=2, padx=12, pady=12)
+
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100, length=460)
+        self.progress.grid(row=1, column=1, padx=12, pady=12, sticky="ew")
+
+        ttk.Label(self, textvariable=self.status_var).grid(row=2, column=1, padx=12, pady=12, sticky="w")
+
+        for col in range(3):
+            self.grid_columnconfigure(col, weight=1)
+
+        self.after(100, self.process_queue)
+
+    # ---------------------- Callbacks UI ------------------------------------
+    def choose_project(self) -> None:
+        path = filedialog.askdirectory(title="Sélectionnez le dossier racine du projet")
+        if not path:
+            return
+
+        self.project_dir = Path(path)
+        self.project_var.set(str(path))
+        self.status_var.set("Analyse du dossier…")
+
+        # Découverte immédiate (rapide) pour préparer la liste
+        self.files_full = discover_sources(self.project_dir)
+        nb = len(self.files_full)
+        if nb == 0:
+            messagebox.showwarning(
+                "Aucun fichier",
+                "Aucun fichier .py ou .java n’a été trouvé dans ce dossier.",
+            )
+            self.btn_export.config(state=tk.DISABLED)
+            self.status_var.set("Aucun fichier trouvé.")
+            return
+
+        self.status_var.set(f"{nb} fichiers détectés. Cliquez sur Exporter pour choisir.")
+        self.btn_export.config(state=tk.NORMAL)
+
+    # ------ Sélecteur de fichiers
+    def open_selector(self) -> None:
+        if not (self.project_dir and self.files_full):
+            return
+
+        dlg = SelectionDialog(self, self.files_full)
+        self.wait_window(dlg)
+
+        selected = dlg.validated
+        if selected is None:           # Annulé
+            return
+        if not selected:
+            messagebox.showerror("Erreur", "Aucun fichier sélectionné !")
+            return
+
+        self.launch_export(selected)
+
+    # ------ Export
+    def launch_export(self, files: Sequence[Path]) -> None:
+        assert self.project_dir is not None  # pour l’IDE/type‑checker
+
+        out_name = filedialog.asksaveasfilename(
+            title="Enregistrer le fichier concaténé",
+            initialdir=str(self.project_dir),
+            initialfile=DEFAULT_OUT_NAME,
+            defaultextension=".txt",
+            filetypes=[("Fichiers texte", "*.txt")],
+        )
+        if not out_name:
+            return
+
+        self.progress["value"] = 0
+        self.btn_export.config(state=tk.DISABLED)
+        self.status_var.set("Export en cours…")
+
+        threading.Thread(
+            target=export_worker,
+            args=(self.project_dir, list(files), Path(out_name), self.queue),
+            daemon=True,
+        ).start()
+
+    # ------ Queue <-> GUI
+    def process_queue(self) -> None:
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+
+                if msg[0] == "progress":
+                    idx, total = msg[1], msg[2]
+                    pct = int(idx / total * 100)
+                    self.progress["value"] = pct
+                    self.status_var.set(f"Fichier {idx}/{total} traité…")
+
+                elif msg[0] == "done":
+                    total_files, out_path = msg[1], msg[2]
+                    self.progress["value"] = 100
+                    self.status_var.set("Export terminé.")
+                    self.btn_export.config(state=tk.NORMAL)
+                    messagebox.showinfo("Succès", f"{total_files} fichiers exportés dans\n{out_path}")
+
+                    # Ouverture automatique (best‑effort)
+                    try:
+                        if sys.platform.startswith("win"):
+                            os.startfile(out_path)            # type: ignore[attr-defined]
+                        elif sys.platform == "darwin":
+                            import subprocess as _sp
+
+                            _sp.Popen(["open", out_path])
+                        else:
+                            import subprocess as _sp
+
+                            _sp.Popen(["xdg-open", out_path])
+                    except Exception:                         # noqa: BLE001
+                        pass
+
+                elif msg[0] == "error":
+                    messagebox.showerror("Erreur", msg[1])
+                    self.btn_export.config(state=tk.NORMAL)
+
+        except Empty:
+            pass
+
+        self.after(100, self.process_queue)
+
+
+# --------------------------------------------------------------------------- #
+#  MAIN                                                                       #
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    ConcatApp().mainloop()
+
+
