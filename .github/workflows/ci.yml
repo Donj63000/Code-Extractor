@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ "*" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    name: Detect project type
+    runs-on: ubuntu-latest
+    outputs:
+      is_python: ${{ steps.out.outputs.is_python }}
+      is_maven:  ${{ steps.out.outputs.is_maven }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: out
+        shell: bash
+        run: |
+          PY_MATCH="$(git ls-files 'pyproject.toml' 'requirements.txt' 'requirements-dev.txt' 'Pipfile' 2>/dev/null | wc -l)"
+          MVN_MATCH="$(git ls-files 'pom.xml' 2>/dev/null | wc -l)"
+          echo "is_python=$([ "$PY_MATCH" -gt 0 ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+          echo "is_maven=$([ "$MVN_MATCH" -gt 0 ] && echo true || echo false)"  >>"$GITHUB_OUTPUT"
+
+  python:
+    name: Python – lint & tests
+    needs: detect
+    if: needs.detect.outputs.is_python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+            **/Pipfile
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -e
+          if [ -f pyproject.toml ]; then
+            python -m pip install --upgrade pip
+            if grep -qi '\[tool.poetry\]' pyproject.toml; then
+              python -m pip install poetry && poetry install --no-interaction
+            elif grep -qi '\[tool.pdm\]' pyproject.toml; then
+              python -m pip install pdm && pdm install
+            else
+              python -m pip install -e .[dev] || true
+              [ -f requirements.txt ] && python -m pip install -r requirements.txt || true
+            fi
+          elif ls requirements*.txt >/dev/null 2>&1; then
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt || python -m pip install -r requirements-dev.txt
+          fi
+
+      - name: Lint (optional but recommended)
+        shell: bash
+        run: |
+          python -m pip install "ruff==0.*" "black==24.*" pytest
+          ruff check .
+          black --check .
+
+      - name: Tests
+        run: pytest -q || python -m pytest -q
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-reports
+          path: |
+            **/pytest-*.xml
+            **/coverage*.xml
+            **/htmlcov
+
+  maven:
+    name: Maven – build & tests
+    needs: detect
+    if: needs.detect.outputs.is_maven == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Ensure wrapper is executable (if present)
+        run: chmod +x mvnw || true
+
+      - name: Build & test
+        shell: bash
+        run: |
+          set -e
+          MVN="mvn"; [ -x mvnw ] && MVN="./mvnw"
+          $MVN -B -ntp -DskipTests=false verify
+
+      - name: Lint (optional)
+        shell: bash
+        run: |
+          MVN="mvn"; [ -x mvnw ] && MVN="./mvnw"
+          $MVN -B -ntp -DskipTests=true --fail-at-end checkstyle:check || echo "Checkstyle non configuré, on ignore."
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-artifacts
+          path: |
+            **/target/*.jar
+            **/target/surefire-reports
+
+  release:
+    name: Draft release on tag
+    needs: [python, maven]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            **/dist/**
+            **/target/*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
