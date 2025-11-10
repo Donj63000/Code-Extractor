@@ -1,6 +1,6 @@
 # Code Extractor
 
-Code Extractor est un utilitaire que j'ai developpe pour les developpeurs qui utilisent des agents IA relies a GitHub et qui se heurtent a des extraits de code hashes, tronques ou difficiles a reconstituer depuis les connecteurs. Le programme assemble l'ensemble du code source (fichiers et arborescence) dans un fichier texte unique et lisible, tout en laissant la possibilite de choisir exactement quels fichiers doivent etre inclus.
+Code Extractor est un utilitaire que j'ai developpe pour les developpeurs qui utilisent des agents IA relies a GitHub et qui se heurtent a des extraits de code hashes, tronques ou difficiles a reconstituer depuis les connecteurs. Le programme assemble l'ensemble du code source (fichiers et arborescence) dans un fichier texte unique et lisible, tout en laissant la possibilite de choisir exactement quels fichiers doivent etre inclus. Spéciale dédicace à mon ami Clody qui m'as indirectement l'idée de developper ce micro software
 
 ---
 
