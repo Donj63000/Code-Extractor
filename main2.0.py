@@ -402,6 +402,7 @@ def _lang_for(p: Path) -> str:
 
 def _chunks(p: Path) -> Iterable[str]:
     try:
+        # Là je tente une lecture directe en UTF-8 strict pour aller au plus simple.
         with p.open("r", encoding="utf-8", errors="strict") as f:
             while True:
                 c = f.read(READ_CHUNK)
@@ -413,6 +414,7 @@ def _chunks(p: Path) -> Iterable[str]:
         pass
     for enc in ("utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"):
         try:
+            # Là je parcours mes encodages de secours pour rattraper les fichiers délicats.
             with p.open("r", encoding=enc, errors="replace") as f:
                 while True:
                     c = f.read(READ_CHUNK)
@@ -427,12 +429,14 @@ def _chunks(p: Path) -> Iterable[str]:
             b = f.read(READ_CHUNK)
             if not b:
                 break
+            # Là je finis par décoder en binaire en dernier recours pour ne rien louper.
             yield b.decode("utf-8", errors="replace")
 
 def _read_preview(p: Path, limit: int = PREVIEW_MAX) -> str:
     acc = []
     total = 0
     for c in _chunks(p):
+        # Là je cumule les morceaux jusqu'à atteindre la limite souhaitée.
         acc.append(c)
         total += len(c)
         if total >= limit:
@@ -524,6 +528,7 @@ def _render_env_template(vars_to_paths: dict[str, set[str]]) -> str:
     """
     cats: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
     for name, paths in vars_to_paths.items():
+        # Là je range chaque variable dans sa catégorie pour garder un ordre lisible.
         cat = _categorize_env(name)
         cats[cat].append((name, sorted(paths, key=str.casefold)))
 
@@ -550,8 +555,10 @@ def _render_env_template(vars_to_paths: dict[str, set[str]]) -> str:
         for name, paths in sorted(cats[cat], key=lambda t: t[0]):
             hint = ENV_HINTS.get(name)
             if hint:
+                # Là je rappelle l'indice pratique pour la variable pour gagner du temps.
                 lines.append(f"# {hint}")
             if paths:
+                # Là je liste les fichiers repérés afin de retracer l'origine de la variable.
                 shown = ", ".join(_shorten(p, 80) for p in paths[:4])
                 more = f" (+{len(paths)-4} autres)" if len(paths) > 4 else ""
                 lines.append(f"# vu dans: {shown}{more}")
@@ -566,6 +573,7 @@ def _env_extract_worker(root: Path, files: Sequence[Path], q: "queue.Queue", can
         if cancel and cancel.is_set():
             q.put(("cancelled", "env"))
             return
+        # Là je lance l'extraction complète puis je prépare le rendu du template.
         result = _extract_env_variables(root, files)
         text = _render_env_template(result)
         q.put(("done_env", result, text))
@@ -596,6 +604,7 @@ def _git_tracked(root: Path) -> set[Path]:
                 continue
             p = (root / rel)
             if p.exists() and p.is_file():
+                # Là je sécurise le chemin absolu pour éviter les doublons en sortie.
                 tracked.add(p.resolve())
         return tracked
     except Exception:
